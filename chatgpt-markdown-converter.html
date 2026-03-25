@@ -936,15 +936,28 @@
               .slice(0, 8);
           },
 
+          formatTimestampYYYYMMDD(ts) {
+            const d = new Date(ts * 1000);
+            const pad = (n) => String(n).padStart(2, "0");
+            return (
+              d.getFullYear() 
+              + pad(d.getMonth() + 1) 
+              + pad(d.getDate())
+            );  
+          },
+
           getConversationSlug(conv) {
             const rawTitle = conv.title || "Untitled";
+            const rawDate = this.formatTimestampYYYYMMDD(conv.create_time)
+            // bGZo: use custom date formatting to avoid locale issues and get consistent short month names
+
             const safeTitle = this.sanitizePathSegment(rawTitle).replace(
               /\s+/g,
               "_",
             );
             const stem = safeTitle || "conversation";
             const suffix = this.getConversationId(conv);
-            return suffix ? `${stem}_${suffix}` : stem;
+            return suffix ? `~${rawDate}-${suffix}-${stem}` : stem;
           },
 
           // NEW: Render <details> body according to config.details_content_format
@@ -1121,18 +1134,22 @@
             if (this.config.use_frontmatter) {
               md += "---\n";
               md += `title: "${title}"\n`;
+              md += `aliaes:\n  - ${title}\n`;
               if (conv.create_time)
                 md += `created: ${this.formatTimestamp(conv.create_time)}\n`;
               if (conv.update_time)
-                md += `updated: ${this.formatTimestamp(conv.update_time)}\n`;
-              md += "tags:\n  - chatgpt\n  - conversation\n---\n\n";
+                md += `modified: ${this.formatTimestamp(conv.update_time)}\n`;
+              md += "comments: true\n";
+              md += "draft: true\n";
+              md += "description: \n";
+              md += "tags:\n  - llm/chatgpt\n  - llm/conversation\n---\n\n";
             }
 
             md += `# ${title}\n\n`;
-            if (this.config.include_date && conv.create_time) {
-              md += `<sub>${this.formatDate(conv.create_time)}</sub>\n\n`;
-            }
-            md += "---\n\n";
+            // if (this.config.include_date && conv.create_time) {
+            //   md += `<sub>${this.formatDate(conv.create_time)}</sub>\n\n`;
+            // }
+            // md += "---\n\n";
 
             const messages = [];
             for (const key in conv.mapping || {}) {
@@ -1170,7 +1187,8 @@
                 }
               }
               const author = this.getAuthorName(msg);
-              const content = await this.getMessageContent(
+              const role = msg.author?.role;
+              const rawContent = await this.getMessageContent(
                 msg,
                 zipContent,
                 imagesFolder,
@@ -1179,12 +1197,18 @@
                 dalleFolder,
                 conversationPath,
               );
+              const content = this.normalizeMsgContent(rawContent);
               if (content.trim()) {
                 let tsStr = "";
                 if (this.config.include_message_timestamps && msg.create_time) {
                   tsStr = ` <sub>${this.formatTimestamp(msg.create_time)}</sub>`;
                 }
-                md += `**${author}**:${tsStr}\n\n${content}\n\n`;
+                if (role === "user") {
+                    md += `## ${author}\n\n${content}\n\n`; 
+                } else {  
+                    md += `### ${author}\n\n${content}\n\n`; 
+                }
+                // md += `**${author}**:${tsStr}\n\n${content}\n\n`;
               }
             }
 
@@ -1244,6 +1268,46 @@
             return baseName;
           },
 
+
+          normalizeMsgContent(raw) {
+            if (!raw) return "";
+
+            // 按代码块分段，避免改坏 ```...``` 里的内容
+            const parts = String(raw).split(/(\x60\x60\x60[\s\S]*?\x60\x60\x60)/g);
+
+            return parts
+              .map((part) => {
+                // 代码块原样返回
+                if (/^\x60\x60\x60/.test(part)) return part;
+
+                let text = part;
+
+                // 1) 替换分割线 ---（含多个-的情况）
+                text = text.replace(/^[ \t]*-{3,}[ \t]*$/gm, "");
+
+                // 2) 标题层级提升：保证正文标题从 h3(###) 起步，保持相对层级
+                // 先找当前最小标题级别
+                const levels = [...text.matchAll(/^(#{1,6})[ \t]+.+$/gm)].map(
+                  (m) => m[1].length
+                );
+                if (levels.length > 0) {
+                  const minLevel = Math.min(...levels);
+
+                  // 只有出现 h1/h2/h3 才提升
+                  if (minLevel < 4) {
+                    const delta = 4 - minLevel;
+                    text = text.replace(
+                      /^(#{1,6})([ \t]+.+)$/gm,
+                      (_, hashes, rest) => "#".repeat(Math.min(6, hashes.length + delta)) + rest
+                    );
+                  }
+                }
+
+                return text;
+              })
+              .join("");
+          },
+
           async getMessageContent(
             msg,
             zipContent,
@@ -1253,6 +1317,7 @@
             dalleFolder,
             conversationPath,
           ) {
+            // const content = this.normalizeMsgContent(msg.content) || {};
             const content = msg.content || {};
             const metadata = msg.metadata || {};
             const contentType = content.content_type || "";
@@ -1637,7 +1702,7 @@
           getRelativeAssetPath(conversationPath, assetFolder) {
             // Count depth: MarkdownFiles/Starred/2025/01-January/file.md
             // Split and subtract 2 (base + filename)
-            const parts = conversationPath.split("/");
+            const parts = conversationPath.split("_");
             const depth = parts.length - 2; // -1 for base "MarkdownFiles", -1 for filename
 
             // Build relative path: ../../../Assets/Images/
@@ -1654,10 +1719,16 @@
           },
 
           formatTimestamp(ts) {
-            return new Date(ts * 1000)
-              .toISOString()
-              .replace("T", " ")
-              .substring(0, 19);
+            const d = new Date(ts * 1000);
+            const pad = (n) => String(n).padStart(2, "0");
+            return (
+              d.getFullYear() +
+              "-" + pad(d.getMonth() + 1) +
+              "-" + pad(d.getDate()) +
+              "T" + pad(d.getHours()) +
+              ":" + pad(d.getMinutes()) +
+              ":" + pad(d.getSeconds())
+            );
           },
 
           formatDate(ts) {
